@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"strings"
 	"time"
+
+	arkose "github.com/acheong08/funcaptcha"
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -24,12 +29,12 @@ var (
 	jar     = tls_client.NewCookieJar()
 	options = []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(360),
-		tls_client.WithClientProfile(tls_client.Safari_IOS_16_0),
+		tls_client.WithClientProfile(tls_client.Firefox_110),
 		tls_client.WithNotFollowRedirects(),
 		tls_client.WithCookieJar(jar), // create cookieJar instance and pass it as argument
 	}
 	client, _      = tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
-	user_agent     = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36"
+	user_agent     = "Mozilla/5.0 (X11; Linux x86_64; rv:114.0) Gecko/20100101 Firefox/114.0"
 	http_proxy     = os.Getenv("http_proxy")
 	authorizations auth_struct
 	OpenAI_HOST    = os.Getenv("OPENAI_HOST")
@@ -65,10 +70,19 @@ func init() {
 				}
 				os.Setenv("PUID", puid)
 				println(puid)
+				client.SetCookies(&url.URL{
+					Host: OpenAI_HOST,
+				}, []*http.Cookie{
+					{
+						Name:  "_puid",
+						Value: puid,
+					},
+				})
 				time.Sleep(24 * time.Hour * 7)
 			}
 		}()
 	}
+	// arkose.SetTLSClient(&client)
 }
 
 func main() {
@@ -125,7 +139,6 @@ func main() {
 		os.Setenv("OPENAI_EMAIL", authorizations.OpenAI_Email)
 		os.Setenv("OPENAI_PASSWORD", authorizations.OpenAI_Password)
 	})
-
 	handler.Any("/api/*path", proxy)
 
 	gin.SetMode(gin.ReleaseMode)
@@ -133,9 +146,6 @@ func main() {
 }
 
 func proxy(c *gin.Context) {
-	// Remove _cfuvid cookie from session
-	jar.SetCookies(c.Request.URL, []*http.Cookie{})
-
 	var url string
 	var err error
 	var request_method string
@@ -149,10 +159,42 @@ func proxy(c *gin.Context) {
 	}
 	request_method = c.Request.Method
 
-	request, err = http.NewRequest(request_method, url, c.Request.Body)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
+	if c.Request.URL.Path == "/api/conversation" {
+		var request_body map[string]interface{}
+		if c.Request.Body != nil {
+			err := json.NewDecoder(c.Request.Body).Decode(&request_body)
+			if err != nil {
+				c.JSON(400, gin.H{"error": "JSON invalid"})
+				return
+			}
+		}
+		// Check if "model" is in the request json
+		if _, ok := request_body["model"]; !ok {
+			c.JSON(400, gin.H{"error": "model not provided"})
+			return
+		}
+		if strings.HasPrefix(request_body["model"].(string), "gpt-4") {
+			if _, ok := request_body["arkose_token"]; !ok {
+				log.Println("arkose token not provided")
+				token, _, err := arkose.GetOpenAIToken()
+				var arkose_token string
+				if err != nil {
+					c.JSON(500, gin.H{"error": err.Error()})
+					return
+				}
+				arkose_token = token
+				request_body["arkose_token"] = arkose_token
+			}
+		}
+		body_json, err := json.Marshal(request_body)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		original_body := bytes.NewReader(body_json)
+		request, _ = http.NewRequest(request_method, url, original_body)
+	} else {
+		request, _ = http.NewRequest(request_method, url, c.Request.Body)
 	}
 	request.Header.Set("Host", ""+OpenAI_HOST+"")
 	request.Header.Set("Origin", "https://"+OpenAI_HOST+"/chat")
@@ -168,14 +210,9 @@ func proxy(c *gin.Context) {
 	request.Header.Set("sec-fetch-site", "same-origin")
 	request.Header.Set("sec-gpc", "1")
 	request.Header.Set("user-agent", user_agent)
-	if os.Getenv("PUID") != "" {
-		request.Header.Set("cookie", "_puid="+os.Getenv("PUID")+";")
+	if c.Request.Header.Get("PUID") != "" {
+		request.Header.Set("cookie", "_puid="+c.Request.Header.Get("PUID")+";")
 	}
-	puid_cookie, err := c.Request.Cookie("_puid")
-	if err == nil {
-		request.Header.Set("cookie", "_puid="+puid_cookie.Value+";")
-	}
-
 	response, err = client.Do(request)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
